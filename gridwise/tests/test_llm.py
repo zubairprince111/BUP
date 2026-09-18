@@ -66,6 +66,13 @@ class TestLLMInterpretation(unittest.TestCase):
                 call_args = mock_groq_instance.chat.completions.create.call_args
                 self.assertEqual(call_args.kwargs["model"], "custom/test-model-99b")
 
+    def test_groq_client_instantiation_httpx_compatibility(self):
+        # Regression test: verifies real Groq SDK instantiates cleanly without TypeError ('proxies' httpx mismatch)
+        from groq import Groq
+        client = Groq(api_key="test_key_regression_check")
+        self.assertIsNotNone(client)
+
 if __name__ == "__main__":
     unittest.main()
+
 
