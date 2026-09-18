@@ -102,7 +102,7 @@ Please interpret these notes and return a JSON object with "directives" containi
 """
 
     groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
-    model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 
     if not groq_api_key or groq_api_key == "your_groq_api_key_here":
         raise LLMInterpretationError("GROQ_API_KEY environment variable is missing or unconfigured.")
@@ -132,11 +132,16 @@ Please interpret these notes and return a JSON object with "directives" containi
 
         except Exception as e:
             last_exception = e
-            logger.warning(f"Groq API call attempt {attempt + 1} failed: {e}")
+            status_info = f" (Status: {getattr(e, 'status_code', 'N/A')})" if hasattr(e, 'status_code') else ""
+            logger.error(
+                f"Groq API call attempt {attempt + 1}/{max_retries + 1} failed for model '{model}'{status_info}: {type(e).__name__} - {e}",
+                exc_info=True
+            )
             if attempt < max_retries:
                 time.sleep(0.5 * (attempt + 1))
 
     raise LLMInterpretationError(f"Failed to interpret operator notes using Groq API after {max_retries + 1} attempts. Last error: {last_exception}")
+
 
 
 
