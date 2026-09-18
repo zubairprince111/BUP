@@ -15,7 +15,7 @@ class LLMInterpretationError(Exception):
 SYSTEM_PROMPT = """You are an AI assistant for a smart grid energy optimization system.
 Your task is to analyze natural language operator notes and interpret them into structured energy schedule directives.
 
-You MUST classify each operator note into exactly ONE of the following 6 supported directive types:
+You MUST classify each operator note into EXACTLY ONE of the following 6 supported directive types:
 
 1. solar_reduction: Reductions or limits on rooftop solar output.
    structured_adjustment: {"hours": [int, ...], "factor": float}
@@ -40,9 +40,16 @@ You MUST classify each operator note into exactly ONE of the following 6 support
    - "hours": unique integers 0-23 sorted ascending.
    - "max_grid_kwh": maximum allowable grid energy draw in kWh per hour.
 
-6. no_op: Irrelevant notes, administrative updates, or notes that do not impact today's 24-hour energy schedule.
+6. no_op: Irrelevant notes, administrative updates, garbage/nonsense, ambiguous/under-specified notes, or unsupported requests.
    applies: false
    structured_adjustment: null
+
+CRITICAL DIRECTIVE CLASSIFICATION & NO_OP RULES:
+- NEVER invent a new or unsupported directive type. You MUST use ONLY one of the 6 listed types above.
+- GARBAGE & NONSENSE: Any ungrammatical string, random character sequence (e.g. "asdfghjkl", "xyz 123", "hello hello hello"), or nonsensical phrase ("banana spaceship", "battery pizza moon", "make the grid happy") MUST be classified as no_op (applies: false, structured_adjustment: null).
+- IRRELEVANT CAMPUS ACTIVITIES: Any note describing general campus announcements, event schedules, or administrative changes ("cafeteria closes at 8 PM", "football match at 6 PM", "sports office deadline", "library opening hours", "security shift update") MUST be classified as no_op.
+- AMBIGUOUS & UNDER-SPECIFIED NOTES: Any note that expresses a vague desire but lacks specific, actionable time windows or required numeric quantities ("Don't use the battery in the afternoon", "Use less power later", "Keep things stable", "Reduce battery usage", "Keep a high battery reserve", "Limit grid usage") MUST NOT have missing values or hours guessed/invented. If time windows or numeric values cannot be derived unambiguously from the text, classify the note as no_op.
+- UNSUPPORTED REQUESTS: Any request outside the 5 active directive types ("Turn off the entire campus", "Prioritize Building A", "Run generator at maximum power", "Sell excess electricity") MUST be classified as no_op.
 
 TIME WINDOW RULES:
 - Use 0-indexed 24-hour system (0 = 12 AM / midnight to 1 AM, 12 = 12 PM / noon to 1 PM, 23 = 11 PM to 12 AM).
@@ -69,12 +76,12 @@ RESPONSE FORMAT RULES:
 """
 
 
+
 def interpret_operator_notes(operator_notes: List[str], battery: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Calls Groq API to interpret 1-3 operator notes into structured directives.
-    Uses bounded retries and falls back to rule-based directive parsing if
-    GROQ_API_KEY is placeholder or returns invalid key error (401).
-    Raises LLMInterpretationError if GROQ_API_KEY is unset or on connection failure.
+    Uses bounded retries and raises LLMInterpretationError on persistent failure.
+    Does NOT silently convert LLM failures to no_op or hard-coded answers.
     """
     num_notes = len(operator_notes)
     
@@ -97,13 +104,8 @@ Please interpret these notes and return a JSON object with "directives" containi
     groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
     model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-    if not groq_api_key:
-        raise LLMInterpretationError("GROQ_API_KEY environment variable is not set.")
-
-    # If key is the default placeholder, fallback to rule-based
-    if groq_api_key == "your_groq_api_key_here":
-        logger.warning("GROQ_API_KEY is set to placeholder. Using deterministic fallback interpreter.")
-        return _rule_based_fallback(operator_notes, battery)
+    if not groq_api_key or groq_api_key == "your_groq_api_key_here":
+        raise LLMInterpretationError("GROQ_API_KEY environment variable is missing or unconfigured.")
 
     max_retries = 2
     last_exception = None
@@ -130,174 +132,12 @@ Please interpret these notes and return a JSON object with "directives" containi
 
         except Exception as e:
             last_exception = e
-            err_str = str(e)
             logger.warning(f"Groq API call attempt {attempt + 1} failed: {e}")
-            if "401" in err_str or "invalid_api_key" in err_str.lower() or "unauthorized" in err_str.lower():
-                logger.warning("Groq API returned 401 Invalid Key. Falling back to deterministic directive interpreter.")
-                return _rule_based_fallback(operator_notes, battery)
             if attempt < max_retries:
                 time.sleep(0.5 * (attempt + 1))
 
     raise LLMInterpretationError(f"Failed to interpret operator notes using Groq API after {max_retries + 1} attempts. Last error: {last_exception}")
 
-
-
-def _rule_based_fallback(operator_notes: List[str], battery: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Deterministic rule-based fallback interpreter for public sample notes
-    and standard natural language operator notes when Groq API is unavailable or unauthenticated.
-    """
-    # Try matching against public sample cases dataset first for exact accuracy
-    sample_map = _get_sample_cases_map()
-    
-    results = []
-    for idx, note in enumerate(operator_notes):
-        norm_note = note.strip().lower()
-        if norm_note in sample_map:
-            directive = dict(sample_map[norm_note])
-            directive["note_index"] = idx
-            results.append(directive)
-            continue
-
-        # Heuristic parsing for arbitrary notes
-        parsed = _heuristic_parse_single_note(note, idx)
-        results.append(parsed)
-
-    return results
-
-
-def _get_sample_cases_map() -> Dict[str, Dict[str, Any]]:
-    """Loads public samples mapping from disk if available."""
-    sample_map = {}
-    try:
-        json_path = os.path.join(os.path.dirname(__file__), "tests", "public_samples.json")
-        if os.path.exists(json_path):
-            with open(json_path, "r", encoding="utf-8") as f:
-                samples = json.load(f)
-                for s in samples:
-                    notes = s.get("operator_notes", [])
-                    exp = s.get("expected_directives", [])
-                    for n, d in zip(notes, exp):
-                        sample_map[n.strip().lower()] = d
-    except Exception:
-        pass
-    return sample_map
-
-
-def _heuristic_parse_single_note(note: str, idx: int) -> Dict[str, Any]:
-    """Parses a single natural language note using pattern heuristics."""
-    text = note.lower()
-
-    # Determine hours
-    hours = []
-    if "noon until 2 pm" in text or "12 pm to 2 pm" in text or "12 pm until 2 pm" in text:
-        hours = [12, 13]
-    elif "1 pm to 3 pm" in text or "13:00 to 15:00" in text or "13:00 and 15:00" in text:
-        hours = [13, 14]
-    elif "2 pm to 4 pm" in text or "14:00 to 16:00" in text or "14:00 and 16:00" in text:
-        hours = [14, 15]
-    elif "6 pm until 9 pm" in text or "6 pm to 9 pm" in text or "18:00 to 21:00" in text:
-        hours = [18, 19, 20]
-    elif "18:00 and 20:00" in text or "18:00 to 20:00" in text or "6 pm to 8 pm" in text:
-        hours = [18, 19]
-    elif "22:00 to 00:00" in text or "10 pm to 12 am" in text or "22:00 until 00:00" in text:
-        hours = [22, 23]
-    elif "14:00 and 15:00" in text or "14:00 to 15:00" in text or "2 pm to 3 pm" in text:
-        hours = [14]
-
-    # Rule 1: Solar reduction
-    if "solar" in text and ("wash" in text or "drop" in text or "reduce" in text or "cut" in text or "cloud" in text or "cleaning" in text):
-        factor = 0.5
-        if "25%" in text or "25 percent" in text:
-            factor = 0.25
-        elif "20%" in text or "20 percent" in text:
-            factor = 0.2
-        elif "50%" in text or "50 percent" in text:
-            factor = 0.5
-        elif "10%" in text or "10 percent" in text:
-            factor = 0.1
-        elif "80%" in text or "80 percent" in text:
-            factor = 0.2
-
-        if not hours:
-            hours = [12, 13]
-
-        return {
-            "note_index": idx,
-            "applies": True,
-            "directive_type": "solar_reduction",
-            "structured_adjustment": {"hours": hours, "factor": factor},
-            "explanation": f"Solar output reduction to factor {factor} during hours {hours} based on operator note."
-        }
-
-    # Rule 2: Minimum battery reserve
-    if "reserve" in text or "minimum battery" in text or "battery reserve" in text:
-        kwh = 200.0
-        import re
-        m = re.search(r'(\d+)\s*kwh', text)
-        if m:
-            kwh = float(m.group(1))
-
-        if not hours:
-            hours = [18, 19, 20]
-
-        return {
-            "note_index": idx,
-            "applies": True,
-            "directive_type": "minimum_battery_reserve",
-            "structured_adjustment": {"hours": hours, "minimum_energy_kwh": kwh},
-            "explanation": f"Minimum battery reserve requirement of {kwh} kWh during hours {hours}."
-        }
-
-    # Rule 3: No charge window
-    if "no charg" in text or "do not charge" in text or "don't charge" in text or "charging ... disabled" in text:
-        if not hours:
-            hours = [14, 15]
-        return {
-            "note_index": idx,
-            "applies": True,
-            "directive_type": "no_charge_window",
-            "structured_adjustment": {"hours": hours},
-            "explanation": f"Battery charging prohibited during hours {hours}."
-        }
-
-    # Rule 4: No discharge window
-    if "no discharg" in text or "do not discharge" in text or "don't discharge" in text:
-        if not hours:
-            hours = [22, 23]
-        return {
-            "note_index": idx,
-            "applies": True,
-            "directive_type": "no_discharge_window",
-            "structured_adjustment": {"hours": hours},
-            "explanation": f"Battery discharging prohibited during hours {hours}."
-        }
-
-    # Rule 5: Max grid window
-    if "max grid" in text or "limit grid" in text or "grid draw" in text or "transformer" in text:
-        max_kwh = 150.0
-        import re
-        m = re.search(r'(\d+)\s*kwh', text)
-        if m:
-            max_kwh = float(m.group(1))
-        if not hours:
-            hours = [14]
-        return {
-            "note_index": idx,
-            "applies": True,
-            "directive_type": "max_grid_window",
-            "structured_adjustment": {"hours": hours, "max_grid_kwh": max_kwh},
-            "explanation": f"Maximum grid draw limit of {max_kwh} kWh per hour during hours {hours}."
-        }
-
-    # Rule 6: No-op
-    return {
-        "note_index": idx,
-        "applies": False,
-        "directive_type": "no_op",
-        "structured_adjustment": None,
-        "explanation": "Operator note does not contain operational energy schedule constraints."
-    }
 
 
 

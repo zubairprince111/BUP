@@ -1,6 +1,9 @@
+import os
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import pulp
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -8,10 +11,11 @@ logger = logging.getLogger(__name__)
 def optimize_energy_schedule(
     hours_data: List[Dict[str, Any]],
     battery_data: Dict[str, Any],
-    directives: List[Dict[str, Any]]
+    directives: List[Dict[str, Any]],
+    solver_name: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
-    Formulates and solves a 24-hour Mixed-Integer Linear Programming (MILP) problem using PuLP and the CBC solver.
+    Formulates and solves a 24-hour Mixed-Integer Linear Programming (MILP) problem using PuLP and CBC or HiGHS.
     Minimizes total grid electricity purchasing cost subject to energy balance, battery physical limits, rate bounds,
     charge/discharge mutual exclusion (binary variables), end-of-day battery neutrality, and operator directives.
     """
@@ -126,9 +130,23 @@ def optimize_energy_schedule(
     # 6. End-of-day neutrality: battery_energy[23] == initial_energy_kwh
     prob += (battery_energy[23] == initial_energy, "EndOfDayNeutrality")
 
-    # Solve MILP Problem using PuLP CBC Solver
-    solver = pulp.PULP_CBC_CMD(msg=False)
+    # Select Solver: HiGHS vs CBC
+    if solver_name is None:
+        solver_name = os.environ.get("GRIDWISE_SOLVER", "CBC").upper()
+    else:
+        solver_name = solver_name.upper()
+
+    if solver_name == "HIGHS":
+        try:
+            solver = pulp.HiGHS(msg=False)
+        except Exception as e:
+            logger.warning(f"HiGHS solver initialization failed: {e}. Falling back to CBC.")
+            solver = pulp.PULP_CBC_CMD(msg=False)
+    else:
+        solver = pulp.PULP_CBC_CMD(msg=False)
+
     prob.solve(solver)
+
 
     status = pulp.LpStatus[prob.status]
     if status not in ["Optimal", "Feasible"]:
